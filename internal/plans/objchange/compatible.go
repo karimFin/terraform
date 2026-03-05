@@ -45,6 +45,7 @@ func assertObjectCompatible(schema *configschema.Block, planned, actual cty.Valu
 		errs = append(errs, path.NewErrorf("%swas present, but now absent", atRoot))
 		return errs
 	}
+
 	if planned.IsNull() {
 		// No further checks possible if both values are null
 		return errs
@@ -75,9 +76,27 @@ func assertObjectCompatible(schema *configschema.Block, planned, actual cty.Valu
 			errs = append(errs, moreErrs...)
 		}
 	}
+
 	for name, blockS := range schema.BlockTypes {
 		plannedV, _ := planned.GetAttr(name).Unmark()
 		actualV, _ := actual.GetAttr(name).Unmark()
+
+		if blockS.Computed {
+			// computed blocks are only null on the wire to the provider to indicate
+			// absence of configuration, but the planned and actual values must
+			// still never be null. The planned value has already been validated, so
+			// we only check that the actual value still conforms.
+			if actualV.IsNull() {
+				errs = append(errs, path.NewErrorf("null block value after apply"))
+				return errs
+			}
+
+			if !plannedV.IsKnown() {
+				// If the block was planned as being unknown, we simply compare the
+				// block values directly as a whole.
+				return AssertValueCompatible(planned, actual)
+			}
+		}
 
 		path := append(path, cty.GetAttrStep{Name: name})
 		switch blockS.Nesting {

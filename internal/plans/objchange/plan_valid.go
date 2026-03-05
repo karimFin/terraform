@@ -73,28 +73,47 @@ func assertPlanValid(schema *configschema.Block, priorState, config, plannedStat
 			continue
 		}
 
-		if !configV.IsKnown() {
-			// An unknown config block represents a dynamic block where the
-			// for_each value is unknown, and therefor cannot be altered by the
-			// provider.
-			errs = append(errs, path.NewErrorf("planned value %#v for unknown dynamic block", plannedV))
-			continue
-		}
-
-		if !plannedV.IsKnown() {
-			// Only dynamic configuration can set blocks to unknown, so this is
-			// not allowed from the provider. This means that either the config
-			// and plan should match, or we have an error where the plan
-			// changed the config value, both of which have been checked.
-			errs = append(errs, path.NewErrorf("attribute representing nested block must not be unknown itself; set nested attribute values to unknown instead"))
+		if !plannedV.IsKnown() && !blockS.Computed {
+			// we check individual block type constraints of what can be
+			// computed in the cases below
+			errs = append(errs, path.NewErrorf("planned unknown value for non-computed block"))
 			continue
 		}
 
 		switch blockS.Nesting {
-		case configschema.NestingSingle, configschema.NestingGroup:
+		case configschema.NestingGroup:
+			// NestingGroup objects cannot be unknown
+			if !plannedV.IsKnown() {
+				errs = append(errs, path.NewErrorf("planned unknown value for NestingGroup block"))
+				continue
+			}
+
+			moreErrs := assertPlanValid(&blockS.Block, priorV, configV, plannedV, path)
+			errs = append(errs, moreErrs...)
+
+		case configschema.NestingSingle:
+			// NestingSingle can be null, and there is no way to assign an unknown config value.
+			if !plannedV.IsKnown() {
+				if !configV.IsNull() {
+					errs = append(errs, path.NewErrorf("planned unknown value for configured block"))
+				}
+				continue
+			}
+
 			moreErrs := assertPlanValid(&blockS.Block, priorV, configV, plannedV, path)
 			errs = append(errs, moreErrs...)
 		case configschema.NestingList:
+			// NestingList cannot be null, but a length of 0 signifies that it is
+			// eligible to be computed
+			if !plannedV.IsKnown() {
+				// an unknown config value is possible with an unknown dynamic
+				// iterator
+				if !configV.IsKnown() || configV.LengthInt() > 0 {
+					errs = append(errs, path.NewErrorf("planned unknown value for configured block"))
+				}
+				continue
+			}
+
 			// A NestingList might either be a list or a tuple, depending on
 			// whether there are dynamically-typed attributes inside. However,
 			// both support a similar-enough API that we can treat them the
@@ -139,6 +158,17 @@ func assertPlanValid(schema *configschema.Block, priorState, config, plannedStat
 				errs = append(errs, moreErrs...)
 			}
 		case configschema.NestingMap:
+			// NestingMap cannot be null, but a length of 0 signifies that it is
+			// eligible to be computed
+			if !plannedV.IsKnown() {
+				// an unknown config value is possible with an unknown dynamic
+				// iterator
+				if !configV.IsKnown() || configV.LengthInt() > 0 {
+					errs = append(errs, path.NewErrorf("planned unknown value for configured block"))
+				}
+				continue
+			}
+
 			if plannedV.IsNull() {
 				errs = append(errs, path.NewErrorf("attribute representing a map of nested blocks must be empty to indicate no blocks, not null"))
 				continue
@@ -213,6 +243,17 @@ func assertPlanValid(schema *configschema.Block, priorState, config, plannedStat
 				}
 			}
 		case configschema.NestingSet:
+			// NestingSet cannot be null, but a length of 0 signifies that it is
+			// eligible to be computed
+			if !plannedV.IsKnown() {
+				// an unknown config value is possible with an unknown dynamic
+				// iterator
+				if !configV.IsKnown() || configV.LengthInt() > 0 {
+					errs = append(errs, path.NewErrorf("planned unknown value for configured block"))
+				}
+				continue
+			}
+
 			if plannedV.IsNull() {
 				errs = append(errs, path.NewErrorf("attribute representing a set of nested blocks must be empty to indicate no blocks, not null"))
 				continue
