@@ -328,6 +328,10 @@ type TestRunModuleCall struct {
 	// Source is the source of the module to test.
 	Source addrs.ModuleSource
 
+	// SourceExpr is the raw HCL expression for the source attribute.
+	// This is used to support dynamic module sources with const variables.
+	SourceExpr hcl.Expression
+
 	// Version is the version of the module to load from the registry.
 	Version VersionConstraint
 
@@ -894,8 +898,13 @@ func decodeTestRunBlock(block *hcl.Block, file *TestFile, experimentsAllowed boo
 	if attr, exists := content.Attributes["state_key"]; exists {
 		rawDiags := gohcl.DecodeExpression(attr.Expr, nil, &r.StateKey)
 		diags = append(diags, rawDiags...)
-	} else if r.Module != nil {
+	} else if r.Module != nil && r.Module.Source != nil {
 		r.StateKey = r.Module.Source.String()
+	} else if r.Module != nil {
+		// Source is not yet resolved (dynamic source expression).
+		// We'll use a placeholder state key that will be updated
+		// once the source is resolved in buildTestModules.
+		r.StateKey = "test." + r.Name
 	} else {
 		r.StateKey = TestMainStateIdentifier // redundant, but let's be explicit
 	}
@@ -964,76 +973,17 @@ func decodeTestRunModuleBlock(block *hcl.Block) (*TestRunModuleCall, hcl.Diagnos
 
 	if attr, exists := content.Attributes["source"]; exists {
 		module.SourceDeclRange = attr.Range
+		module.SourceExpr = attr.Expr
 
-		var raw string
-		rawDiags := gohcl.DecodeExpression(attr.Expr, nil, &raw)
-		diags = append(diags, rawDiags...)
-		if !rawDiags.HasErrors() {
-			var err error
-			if haveVersionArg {
-				module.Source, err = moduleaddrs.ParseModuleSourceRegistry(raw)
-			} else {
-				module.Source, err = moduleaddrs.ParseModuleSource(raw)
-			}
-			if err != nil {
-				// NOTE: We leave mc.SourceAddr as nil for any situation where the
-				// source attribute is invalid, so any code which tries to carefully
-				// use the partial result of a failed config decode must be
-				// resilient to that.
-				module.Source = nil
-
-				// NOTE: In practice it's actually very unlikely to end up here,
-				// because our source address parser can turn just about any string
-				// into some sort of remote package address, and so for most errors
-				// we'll detect them only during module installation. There are
-				// still a _few_ purely-syntax errors we can catch at parsing time,
-				// though, mostly related to remote package sub-paths and local
-				// paths.
-				switch err := err.(type) {
-				case *moduleaddrs.MaybeRelativePathErr:
-					diags = append(diags, &hcl.Diagnostic{
-						Severity: hcl.DiagError,
-						Summary:  "Invalid module source address",
-						Detail: fmt.Sprintf(
-							"Terraform failed to determine your intended installation method for remote module package %q.\n\nIf you intended this as a path relative to the current module, use \"./%s\" instead. The \"./\" prefix indicates that the address is a relative filesystem path.",
-							err.Addr, err.Addr,
-						),
-						Subject: module.SourceDeclRange.Ptr(),
-					})
-				default:
-					if haveVersionArg {
-						// In this case we'll include some extra context that
-						// we assumed a registry source address due to the
-						// version argument.
-						diags = append(diags, &hcl.Diagnostic{
-							Severity: hcl.DiagError,
-							Summary:  "Invalid registry module source address",
-							Detail:   fmt.Sprintf("Failed to parse module registry address: %s.\n\nTerraform assumed that you intended a module registry source address because you also set the argument \"version\", which applies only to registry modules.", err),
-							Subject:  module.SourceDeclRange.Ptr(),
-						})
-					} else {
-						diags = append(diags, &hcl.Diagnostic{
-							Severity: hcl.DiagError,
-							Summary:  "Invalid module source address",
-							Detail:   fmt.Sprintf("Failed to parse module source address: %s.", err),
-							Subject:  module.SourceDeclRange.Ptr(),
-						})
-					}
-				}
-			}
-
-			switch module.Source.(type) {
-			case addrs.ModuleSourceRemote:
-				// We only support local or registry modules when loading
-				// modules directly from alternate sources during a test
-				// execution.
-				diags = append(diags, &hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Invalid module source address",
-					Detail:   "Only local or registry module sources are currently supported from within test run blocks.",
-					Subject:  module.SourceDeclRange.Ptr(),
-				})
-			}
+		// Check if the expression contains variable references. If it does,
+		// we defer evaluation to buildTestModules where const variable values
+		// are available. Otherwise, we can resolve the source address now.
+		if len(attr.Expr.Variables()) > 0 {
+			// Dynamic source — will be resolved in buildTestModules.
+			module.Source = nil
+		} else {
+			sourceDiags := decodeTestRunModuleSource(&module, attr.Expr, haveVersionArg)
+			diags = append(diags, sourceDiags...)
 		}
 	} else {
 		// Must have a source attribute.
@@ -1046,6 +996,72 @@ func decodeTestRunModuleBlock(block *hcl.Block) (*TestRunModuleCall, hcl.Diagnos
 	}
 
 	return &module, diags
+}
+
+// decodeTestRunModuleSource evaluates a static module source expression and
+// parses the resulting address. This is used for source expressions that don't
+// contain variable references and can be resolved at parse time.
+func decodeTestRunModuleSource(module *TestRunModuleCall, expr hcl.Expression, haveVersionArg bool) hcl.Diagnostics {
+	var diags hcl.Diagnostics
+
+	var raw string
+	rawDiags := gohcl.DecodeExpression(expr, nil, &raw)
+	diags = append(diags, rawDiags...)
+	if rawDiags.HasErrors() {
+		return diags
+	}
+
+	var err error
+	if haveVersionArg {
+		module.Source, err = moduleaddrs.ParseModuleSourceRegistry(raw)
+	} else {
+		module.Source, err = moduleaddrs.ParseModuleSource(raw)
+	}
+	if err != nil {
+		module.Source = nil
+
+		switch err := err.(type) {
+		case *moduleaddrs.MaybeRelativePathErr:
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid module source address",
+				Detail: fmt.Sprintf(
+					"Terraform failed to determine your intended installation method for remote module package %q.\n\nIf you intended this as a path relative to the current module, use \"./%s\" instead. The \"./\" prefix indicates that the address is a relative filesystem path.",
+					err.Addr, err.Addr,
+				),
+				Subject: module.SourceDeclRange.Ptr(),
+			})
+		default:
+			if haveVersionArg {
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid registry module source address",
+					Detail:   fmt.Sprintf("Failed to parse module registry address: %s.\n\nTerraform assumed that you intended a module registry source address because you also set the argument \"version\", which applies only to registry modules.", err),
+					Subject:  module.SourceDeclRange.Ptr(),
+				})
+			} else {
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid module source address",
+					Detail:   fmt.Sprintf("Failed to parse module source address: %s.", err),
+					Subject:  module.SourceDeclRange.Ptr(),
+				})
+			}
+		}
+		return diags
+	}
+
+	switch module.Source.(type) {
+	case addrs.ModuleSourceRemote:
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid module source address",
+			Detail:   "Only local or registry module sources are currently supported from within test run blocks.",
+			Subject:  module.SourceDeclRange.Ptr(),
+		})
+	}
+
+	return diags
 }
 
 func decodeTestRunOptionsBlock(block *hcl.Block) (*TestRunOptions, hcl.Diagnostics) {

@@ -13,6 +13,7 @@ import (
 	version "github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
+	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/getmodules/moduleaddrs"
@@ -34,7 +35,7 @@ func BuildConfig(root *Module, walker ModuleWalker, loader MockDataLoader) (*Con
 	}
 	cfg.Root = cfg // Root module is self-referential.
 	cfg.Children, diags = buildChildModules(cfg, walker)
-	diags = append(diags, FinalizeConfig(cfg, walker, loader)...)
+	diags = append(diags, FinalizeConfig(cfg, walker, loader, nil)...)
 
 	return cfg, diags
 }
@@ -43,12 +44,15 @@ func BuildConfig(root *Module, walker ModuleWalker, loader MockDataLoader) (*Con
 // shared by different configuration loaders.
 //
 // Callers must ensure cfg.Root is set correctly before calling this function.
-func FinalizeConfig(cfg *Config, walker ModuleWalker, loader MockDataLoader) hcl.Diagnostics {
+// constVarOverrides provides explicit values for const variables (e.g. from
+// -var flags) used to resolve dynamic module source expressions in test run
+// blocks. It may be nil when no overrides are available.
+func FinalizeConfig(cfg *Config, walker ModuleWalker, loader MockDataLoader, constVarOverrides map[string]cty.Value) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 	if cfg == nil {
 		return diags
 	}
-	diags = append(diags, buildTestModules(cfg, walker)...)
+	diags = append(diags, buildTestModules(cfg, walker, constVarOverrides)...)
 
 	// Skip provider resolution if there are any errors, since the provider
 	// configurations themselves may not be valid.
@@ -97,13 +101,77 @@ func installMockDataFiles(root *Config, loader MockDataLoader) hcl.Diagnostics {
 	return diags
 }
 
-func buildTestModules(root *Config, walker ModuleWalker) hcl.Diagnostics {
+func buildTestModules(root *Config, walker ModuleWalker, constVarOverrides map[string]cty.Value) hcl.Diagnostics {
 	var diags hcl.Diagnostics
+
+	// Build an eval context from const variable defaults and any overrides
+	// so that dynamic module source expressions can be resolved.
+	variables := make(map[string]cty.Value)
+	for name, v := range root.Module.Variables {
+		if v.Const && v.Default != cty.NilVal {
+			variables[name] = v.Default
+		}
+	}
+	for name, val := range constVarOverrides {
+		variables[name] = val
+	}
+	var evalCtx *hcl.EvalContext
+	if len(variables) > 0 {
+		evalCtx = &hcl.EvalContext{
+			Variables: map[string]cty.Value{
+				"var": cty.ObjectVal(variables),
+			},
+		}
+	}
 
 	for name, file := range root.Module.Tests {
 		for _, run := range file.Runs {
 			if run.Module == nil {
 				continue
+			}
+
+			// Resolve the module source from the stored expression.
+			// The expression was stored during parsing and is evaluated
+			// here with const variable values available.
+			if run.Module.Source == nil && run.Module.SourceExpr != nil {
+
+				var raw string
+				rawDiags := gohcl.DecodeExpression(run.Module.SourceExpr, evalCtx, &raw)
+				diags = append(diags, rawDiags...)
+				if rawDiags.HasErrors() {
+					continue
+				}
+
+				haveVersionArg := run.Module.Version.Required != nil
+				var err error
+				if haveVersionArg {
+					run.Module.Source, err = moduleaddrs.ParseModuleSourceRegistry(raw)
+				} else {
+					run.Module.Source, err = moduleaddrs.ParseModuleSource(raw)
+				}
+				if err != nil {
+					diags = append(diags, &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Invalid module source address",
+						Detail:   fmt.Sprintf("Failed to parse module source address: %s.", err),
+						Subject:  run.Module.SourceDeclRange.Ptr(),
+					})
+					continue
+				}
+
+				switch run.Module.Source.(type) {
+				case addrs.ModuleSourceRemote:
+					diags = append(diags, &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Invalid module source address",
+						Detail:   "Only local or registry module sources are currently supported from within test run blocks.",
+						Subject:  run.Module.SourceDeclRange.Ptr(),
+					})
+					continue
+				}
+
+				// Update the state key now that the source is resolved.
+				run.StateKey = run.Module.Source.String()
 			}
 
 			// We want to make sure the path for the testing modules are unique

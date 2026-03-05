@@ -242,6 +242,7 @@ func (m *Meta) installModules(ctx context.Context, rootDir, testsDir string, upg
 		return true, diags
 	}
 
+	var inst *initwd.ModuleInstaller
 	initializer := func(rootMod *configs.Module, walker configs.ModuleWalker) (*configs.Config, tfdiags.Diagnostics) {
 		variables, diags := backendrun.ParseConstVariableValues(m.VariableValues, rootMod.Variables)
 		ctx, ctxDiags := terraform.NewContext(&terraform.ContextOpts{
@@ -251,12 +252,23 @@ func (m *Meta) installModules(ctx context.Context, rootDir, testsDir string, upg
 		if diags.HasErrors() {
 			return nil, diags
 		}
+
+		// Pass const variable override values so that dynamic module source
+		// expressions in test run blocks can be resolved during finalization.
+		constVarOverrides := make(map[string]cty.Value)
+		for name, val := range variables {
+			if val.Value != cty.NilVal {
+				constVarOverrides[name] = val.Value
+			}
+		}
+		inst.ConstVarOverrides = constVarOverrides
+
 		return ctx.Init(rootMod, terraform.InitOpts{
 			Walker:       walker,
 			SetVariables: variables,
 		})
 	}
-	inst := initwd.NewModuleInstaller(m.modulesDir(), loader, m.registryClient(), initializer)
+	inst = initwd.NewModuleInstaller(m.modulesDir(), loader, m.registryClient(), initializer)
 
 	_, moreDiags := inst.InstallModules(ctx, rootDir, testsDir, upgrade, installErrsOnly, hooks)
 	diags = diags.Append(moreDiags)

@@ -4,6 +4,8 @@
 package terraform
 
 import (
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -35,7 +37,16 @@ func BuildConfigWithGraph(rootMod *configs.Module, walker configs.ModuleWalker, 
 		return cfg, diags
 	}
 
-	finalDiags := configs.FinalizeConfig(cfg, walker, loader)
+	// Extract const variable override values to pass through for resolving
+	// dynamic module source expressions in test run blocks.
+	constVarOverrides := make(map[string]cty.Value)
+	for name, val := range vars {
+		if val.Value != cty.NilVal {
+			constVarOverrides[name] = val.Value
+		}
+	}
+
+	finalDiags := configs.FinalizeConfig(cfg, walker, loader, constVarOverrides)
 	diags = diags.Append(finalDiags)
 
 	return cfg, diags

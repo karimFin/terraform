@@ -2718,6 +2718,65 @@ func TestTest_DynamicSourceWithSetupModule(t *testing.T) {
 	}
 }
 
+func TestTest_DynamicSourceWithTestVariables(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "dynamic_source_with_test_variables")), td)
+	t.Chdir(td)
+
+	store := &testing_command.ResourceStore{
+		Data: make(map[string]cty.Value),
+	}
+	providerSource, close := newMockProviderSource(t, map[string][]string{
+		"test": {"1.0.0"},
+	})
+	defer close()
+
+	streams, done := terminal.StreamsForTesting(t)
+	view := views.NewView(streams)
+	ui := new(cli.MockUi)
+
+	meta := Meta{
+		testingOverrides: &testingOverrides{
+			Providers: map[addrs.Provider]providers.Factory{
+				addrs.NewDefaultProvider("test"): func() (providers.Interface, error) {
+					return testing_command.NewProvider(store).Provider, nil
+				},
+			},
+		},
+		Ui:             ui,
+		View:           view,
+		Streams:        streams,
+		ProviderSource: providerSource,
+	}
+
+	init := &InitCommand{Meta: meta}
+	if code := init.Run(nil); code != 0 {
+		output := done(t)
+		t.Fatalf("expected status code 0 but got %d: %s", code, output.All())
+	}
+
+	// Reset the streams for the next command.
+	streams, done = terminal.StreamsForTesting(t)
+	meta.Streams = streams
+	meta.View = views.NewView(streams)
+
+	c := &TestCommand{Meta: meta}
+	code := c.Run([]string{"-no-color"})
+	output := done(t)
+
+	if code != 0 {
+		t.Errorf("expected status code 0 but got %d:\n\n%s", code, output.All())
+	}
+
+	if !strings.Contains(output.Stdout(), "1 passed, 0 failed.") {
+		t.Errorf("output didn't contain expected string:\n\n%s", output.Stdout())
+	}
+
+	if len(store.Data) != 0 {
+		t.Errorf("should have deleted all resources on completion but left %d", len(store.Data))
+	}
+}
+
 func TestTest_CatchesErrorsBeforeDestroy(t *testing.T) {
 	td := t.TempDir()
 	testCopyDir(t, testFixturePath(path.Join("test", "invalid_default_state")), td)

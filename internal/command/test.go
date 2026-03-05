@@ -370,6 +370,11 @@ func (m *Meta) setupTestExecution(mode moduletest.CommandMode, command string, r
 			constVars[name] = val
 		}
 	}
+	for name, val := range preparation.TestVariables {
+		if decl, exists := earlyMod.Variables[name]; exists && decl.Const {
+			constVars[name] = val
+		}
+	}
 	m.VariableValues = constVars
 
 	preparation.Config, moreDiags = m.loadConfigWithTests(".", preparation.Args.TestDirectory)

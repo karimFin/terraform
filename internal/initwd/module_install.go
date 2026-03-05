@@ -17,6 +17,7 @@ import (
 	version "github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
@@ -46,6 +47,11 @@ type ModuleInstaller struct {
 	registryPackageSources map[moduleVersion]addrs.ModuleSourceRemote
 
 	initializer Initializer
+
+	// ConstVarOverrides provides explicit values for const variables
+	// used to resolve dynamic module source expressions in test run blocks
+	// during finalization. It may be nil when no overrides are available.
+	ConstVarOverrides map[string]cty.Value
 }
 
 type moduleVersion struct {
@@ -152,7 +158,7 @@ func (i *ModuleInstaller) InstallModules(ctx context.Context, rootDir, testsDir 
 		diags = diags.Append(instDiags)
 	}
 
-	finalDiags := configs.FinalizeConfig(cfg, walker, configs.MockDataLoaderFunc(i.loader.LoadExternalMockData))
+	finalDiags := configs.FinalizeConfig(cfg, walker, configs.MockDataLoaderFunc(i.loader.LoadExternalMockData), i.ConstVarOverrides)
 	diags = diags.Append(finalDiags)
 
 	if diags.HasErrors() {
